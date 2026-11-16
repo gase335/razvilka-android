@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+[package]
+name = "razvilka-android"
+version = "1.0.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "JNI-мост Razvilka для Android (VpnService): движок + ядро csqtt в одном процессе"
+
+[lib]
+name = "razvilka_android"
+# cdylib — грузится из Kotlin как librazvilka_android.so
+crate-type = ["cdylib"]
+
+[dependencies]
+# Движок Razvilka без GUI (eframe/wry/rfd/arboard отключены)
+razvilka = { path = "../client", default-features = false }
+csqtt-core = { path = "../backend" }
+jni = "0.21"
+serde_json = "1"
+log = "0.4"
+anyhow = "1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Проброс Rust-логов (log-фасад) в logcat
+android_logger = "0.14"
+
+# [patch] действует из корневого манифеста сборки — здесь это android-jni.
+[patch.crates-io]
+primp = { path = "../backend/vendor/primp" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# unwind обязателен: ядро csqtt ловит собственные паники через catch_unwind
+# (см. backend/logging.rs). На JNI-границе паники перехватываются в каждой
+# экспортируемой функции (catch_unwind ниже), в Java они не уходят.
+panic = "unwind"
+strip = true

@@ -1,0 +1,37 @@
+# Сборка Razvilka на GitHub Actions (Windows x64) + тесты движка.
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Тесты движка (с имитатором ядра)
+        working-directory: client
+        run: cargo test --no-default-features --features mock --ignore-rust-version -- --test-threads=1
+      - name: Сборка
+        working-directory: client
+        run: cargo build --release --features webview --ignore-rust-version
+      - name: Портативный архив
+        shell: pwsh
+        run: |
+          $d = 'dist/Razvilka'; New-Item -ItemType Directory -Force $d | Out-Null
+          Copy-Item client/target/release/razvilka.exe, dist-assets/wintun.dll, dist-assets/geoip.dat, README.md $d
+          $wv = Get-ChildItem -Recurse -Path "$env:USERPROFILE/.cargo/registry/src" -Filter WebView2Loader.dll | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
+          Copy-Item $wv.FullName $d
+          Compress-Archive -Path $d -DestinationPath dist/razvilka-windows-x64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: razvilka-windows-x64
+          path: dist/razvilka-windows-x64.zip

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Базовая тема окна. UI рисует Jetpack Compose (MaterialTheme), поэтому
+         здесь достаточно темы без ActionBar из системного набора. -->
+    <style name="Theme.Razvilka" parent="@android:style/Theme.DeviceDefault.NoActionBar" />
+</resources>
