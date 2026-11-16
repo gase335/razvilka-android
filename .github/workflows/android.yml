@@ -27,6 +27,9 @@ jobs:
 
       - name: Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Не ставить устаревший пакет 'tools' (его больше нет в репозитории).
+          packages: ''
 
       - name: NDK + платформа + build-tools
         run: |
