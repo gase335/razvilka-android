@@ -524,6 +524,17 @@ impl Dispatcher {
                 dispatcher.tasks.lock().await.push(io_task);
                 return Ok((dispatcher, "0".to_owned()));
             }
+            // [Android] Нативный TUN-режим (ядро само владеет TUN) на Android не
+            // используется: Развилка держит TUN у VpnService и кормит ядро по
+            // UDP (listen). Без этой ветки arm `if let Some` возвращал бы () на
+            // android (ни windows-, ни linux-код не компилируется) → E0308.
+            #[cfg(not(any(windows, target_os = "linux")))]
+            {
+                let _ = (&fd_tx, &mut fd_rx);
+                anyhow::bail!(
+                    "нативный TUN-режим {name:?} не поддерживается на этой платформе — используйте UDP-режим (listen)"
+                );
+            }
         } else {
             let socket = bind_udp(listen).await?;
             let local_port = socket.local_addr()?.port().to_string();
