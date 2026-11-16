@@ -16,6 +16,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -59,9 +61,27 @@ jobs:
         working-directory: android-app
         run: gradle assembleDebug -PrustTargets=${{ github.event.inputs.abis || 'arm64' }} --no-daemon --stacktrace
 
-      - name: Загрузка APK
+      - name: Загрузка APK (артефакт)
         uses: actions/upload-artifact@v4
         with:
           name: razvilka-debug-apk
           path: android-app/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      # Публикуем APK в ветку build-apk, чтобы его можно было забрать по git
+      # (артефакты Actions отдаются с Azure-хоста, недоступного из песочницы).
+      - name: Публикация APK в ветку build-apk
+        if: success()
+        run: |
+          set -e
+          APK=$(find android-app/app/build/outputs/apk/debug -name '*.apk' | head -1)
+          echo "APK: $APK ($(du -h "$APK" | cut -f1))"
+          cp "$APK" /tmp/razvilka-debug.apk
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git checkout --orphan build-apk
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/razvilka-debug.apk razvilka-debug.apk
+          git add razvilka-debug.apk
+          git commit -q -m "APK build ${GITHUB_SHA::7}"
+          git push -f origin build-apk
