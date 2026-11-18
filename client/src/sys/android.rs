@@ -71,11 +71,13 @@ struct AndroidTun {
 
 impl AndroidTun {
     fn new(vpn_fd: RawFd) -> io::Result<Self> {
-        // Своя копия дескриптора: Kotlin закроет оригинал независимо от нас.
-        let tun_fd = unsafe { libc::dup(vpn_fd) };
-        if tun_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        // НЕ дублируем fd. Владелец дескриптора — Kotlin (ParcelFileDescriptor);
+        // закрытие PFD в Kotlin — единственный и гарантированный способ снять
+        // VPN-интерфейс. dup приводил к тому, что копия fd жила в процессе
+        // приложения и держала туннель активным даже после остановки службы
+        // (отсюда «нет интернета после отключения»). Rust только читает/пишет
+        // этот fd и НЕ закрывает его.
+        let tun_fd = vpn_fd;
         // Неблокирующий режим: блокировкой управляет poll (чтобы interrupt будил).
         let flags = unsafe { libc::fcntl(tun_fd, libc::F_GETFL) };
         if flags >= 0 {
@@ -85,11 +87,10 @@ impl AndroidTun {
         }
         let event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if event_fd < 0 {
-            let err = io::Error::last_os_error();
-            unsafe { libc::close(tun_fd) };
-            return Err(err);
+            return Err(io::Error::last_os_error());
         }
         TUN_FD_OPEN.store(true, Ordering::Release);
+        crate::rlog!("[TUN] адаптер подключён к fd VpnService");
         Ok(Self { tun_fd, event_fd })
     }
 }
@@ -162,13 +163,14 @@ impl TunIo for AndroidTun {
 
 impl Drop for AndroidTun {
     fn drop(&mut self) {
+        // Закрываем только eventfd. tun_fd НЕ трогаем — им владеет Kotlin-PFD
+        // (двойное закрытие недопустимо). Сбрасываем флаг — читатель больше не
+        // использует fd, Kotlin может безопасно закрыть PFD и снять интерфейс.
         unsafe {
-            libc::close(self.tun_fd);
             libc::close(self.event_fd);
         }
-        // fd туннеля закрыт — Android снимет VPN-интерфейс; Kotlin может
-        // закрывать свой PFD и останавливать службу.
         TUN_FD_OPEN.store(false, Ordering::Release);
+        crate::rlog!("[TUN] читатель остановлен, fd отпущен ядром");
     }
 }
 

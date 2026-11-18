@@ -112,13 +112,21 @@ fn do_start_tunnel() {
 fn do_stop_tunnel() {
     if let Some(s) = state() {
         let cfg = s.config.lock().unwrap().clone();
+        razvilka::engine::logbus::bus().push("[JNI] стоп туннеля: жду освобождения fd ядром");
         s.engine.set_tunnel(cfg, false);
-        // Ждём, пока ядро реально отпустит dup fd туннеля: пока он открыт,
-        // Android держит VPN-интерфейс, и закрывать PFD/останавливать службу
-        // нельзя (иначе трафик уходит в мёртвый туннель — нет интернета).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        // Ждём, пока ядро реально отпустит fd туннеля (читатель остановлен).
+        // Пока fd в работе у Rust — Kotlin не должен закрывать PFD.
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(6);
         while razvilka::sys::is_tun_fd_open() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let ms = start.elapsed().as_millis();
+        if razvilka::sys::is_tun_fd_open() {
+            razvilka::engine::logbus::bus()
+                .push(format!("[JNI] ВНИМАНИЕ: fd не отпущен за {ms} мс (таймаут)"));
+        } else {
+            razvilka::engine::logbus::bus().push(format!("[JNI] fd отпущен за {ms} мс"));
         }
     }
 }
