@@ -58,6 +58,12 @@ object ConfigStore {
             .put("captureIpv6", c.captureIpv6)
             .put("autoRestart", c.autoRestart)
             .put("lanDirect", c.lanDirect)
+            .put("proxyEnabled", c.proxyEnabled)
+            .put("proxyPort", c.proxyPort)
+            .put("proxyListenIp", c.proxyListenIp)
+            .put("proxyAuth", c.proxyAuth)
+            .put("proxyUser", c.proxyUser)
+            .put("proxyPass", c.proxyPass)
             .put("list", list)
     }
 
@@ -88,6 +94,12 @@ object ConfigStore {
             captchaMode = o.optString("captchaMode", "auto"),
             tunnelMode = o.optString("tunnelMode", "blacklist"),
             list = list,
+            proxyEnabled = o.optBoolean("proxyEnabled", false),
+            proxyPort = o.optInt("proxyPort", 1080),
+            proxyListenIp = o.optString("proxyListenIp", ""),
+            proxyAuth = o.optBoolean("proxyAuth", false),
+            proxyUser = o.optString("proxyUser", ""),
+            proxyPass = o.optString("proxyPass", ""),
             captureIpv6 = o.optBoolean("captureIpv6", false),
             autoRestart = o.optBoolean("autoRestart", true),
             lanDirect = o.optBoolean("lanDirect", true),

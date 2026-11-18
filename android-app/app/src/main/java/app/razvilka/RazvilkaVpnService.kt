@@ -11,18 +11,22 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
+import org.json.JSONObject
 
 /**
- * VPN-служба Razvilka. Поднимает TUN через VpnService.Builder, отдаёт его fd в
+ * VPN-служба Развилки. Поднимает TUN через VpnService.Builder, отдаёт его fd в
  * Rust-ядро и держит туннель в foreground.
  *
- * Ключевой момент: addDisallowedApplication(собственный пакет) выводит трафик
- * самого приложения (TURN-сокеты ядра, «прямые» соединения движка) из туннеля —
- * поэтому обход VPN работает без per-socket protect().
+ * addDisallowedApplication(собственный пакет) выводит трафик приложения (сокеты
+ * ядра к TURN, «прямые» соединения движка) из туннеля — обход VPN без protect().
  */
 class RazvilkaVpnService : VpnService() {
 
     private var tun: ParcelFileDescriptor? = null
+    @Volatile private var statsThread: Thread? = null
+    @Volatile private var lastUp = 0L
+    @Volatile private var lastDown = 0L
+    @Volatile private var lastTs = 0L
 
     companion object {
         const val ACTION_START = "app.razvilka.action.START"
@@ -42,14 +46,22 @@ class RazvilkaVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // intent == null → служба воскрешена системой после убийства. НЕ
+        // поднимаем VPN сами (иначе туннель встаёт без рабочего ядра и глушит
+        // весь трафик) — просто гасимся.
         when (intent?.action) {
+            null -> {
+                stopSelfCleanly()
+                return START_NOT_STICKY
+            }
             ACTION_STOP -> {
                 stopTunnel()
                 return START_NOT_STICKY
             }
             else -> startTunnel()
         }
-        return START_STICKY
+        // NOT_STICKY: система не перезапускает службу с null-интентом.
+        return START_NOT_STICKY
     }
 
     private fun startTunnel() {
@@ -62,7 +74,6 @@ class RazvilkaVpnService : VpnService() {
         ConfigStore.ensureGeoip(this)
         val cfg = ConfigStore.load(this)
         if (cfg.host.isBlank() || cfg.password.isBlank() || cfg.vkHashes.isBlank()) {
-            // Нечего подключать — не поднимаем туннель.
             stopSelfCleanly()
             return
         }
@@ -73,7 +84,6 @@ class RazvilkaVpnService : VpnService() {
             .setMtu(MTU)
             .addAddress(TUN_V4, 30)
             .addDnsServer(DNS_V4)
-            // Половинные маршруты перехватывают любой дефолт (как на десктопе).
             .addRoute("0.0.0.0", 1)
             .addRoute("128.0.0.0", 1)
         if (cfg.captureIpv6) {
@@ -81,11 +91,9 @@ class RazvilkaVpnService : VpnService() {
             builder.addRoute("::", 1)
             builder.addRoute("8000::", 1)
         }
-        // Вывести собственный трафик приложения из туннеля (обход для TURN/VK).
         try {
             builder.addDisallowedApplication(packageName)
         } catch (e: Exception) {
-            // Пакет не найден — не критично, но обход может не работать.
         }
         builder.setBlocking(true)
 
@@ -101,8 +109,11 @@ class RazvilkaVpnService : VpnService() {
         tun = pfd
         NativeBridge.nativeSetTunFd(pfd.fd)
         NativeBridge.nativeStartTunnel()
+        if (cfg.proxyEnabled) {
+            try { NativeBridge.nativeStartProxy() } catch (e: Exception) {}
+        }
         running = true
-        updateNotification(getString(R.string.state_connected))
+        startStatsLoop()
     }
 
     private fun stopTunnel() {
@@ -110,21 +121,24 @@ class RazvilkaVpnService : VpnService() {
             stopSelfCleanly()
             return
         }
-        try {
-            NativeBridge.nativeStopTunnel()
-            NativeBridge.nativeClearTunFd()
-        } catch (e: Exception) {
-            // ignore
-        }
-        // Ядро владеет собственным dup fd и само его закроет; закрываем свой PFD.
-        try {
-            tun?.close()
-        } catch (e: Exception) {
-            // ignore
-        }
-        tun = null
         running = false
-        stopSelfCleanly()
+        statsThread?.interrupt()
+        statsThread = null
+        // Блокирующий стоп (ядро отпустит dup fd туннеля) — в фоне, не на main.
+        Thread {
+            try {
+                NativeBridge.nativeStopProxy()
+            } catch (e: Exception) {}
+            try {
+                NativeBridge.nativeStopTunnel()   // блокирует до закрытия fd ядром
+                NativeBridge.nativeClearTunFd()
+            } catch (e: Exception) {}
+            try {
+                tun?.close()
+            } catch (e: Exception) {}
+            tun = null
+            stopSelfCleanly()
+        }.start()
     }
 
     private fun stopSelfCleanly() {
@@ -138,16 +152,65 @@ class RazvilkaVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        statsThread?.interrupt()
+        statsThread = null
         if (running || tun != null) {
-            stopTunnel()
+            // Синхронно освобождаем туннель, чтобы не оставить мёртвый интерфейс.
+            running = false
+            try { NativeBridge.nativeStopProxy() } catch (e: Exception) {}
+            try {
+                NativeBridge.nativeStopTunnel()
+                NativeBridge.nativeClearTunFd()
+            } catch (e: Exception) {}
+            try { tun?.close() } catch (e: Exception) {}
+            tun = null
         }
         super.onDestroy()
     }
 
     override fun onRevoke() {
-        // Пользователь отозвал разрешение VPN в системе.
         stopTunnel()
         super.onRevoke()
+    }
+
+    // ───────────────────────── живое уведомление (#3) ─────────────────────────
+
+    private fun startStatsLoop() {
+        lastUp = 0; lastDown = 0; lastTs = System.currentTimeMillis()
+        val t = Thread {
+            while (running && !Thread.currentThread().isInterrupted) {
+                try {
+                    Thread.sleep(2000)
+                } catch (e: InterruptedException) {
+                    break
+                }
+                if (!running) break
+                try {
+                    val st = JSONObject(NativeBridge.nativeStatus())
+                    val sessions = st.optJSONArray("sessions")
+                    var workers = 0L
+                    if (sessions != null) {
+                        for (i in 0 until sessions.length()) {
+                            workers += sessions.getJSONObject(i).optLong("activeWorkers", 0)
+                        }
+                    }
+                    val totals = st.optJSONObject("totals")
+                    val up = totals?.optLong("vpnUp", 0) ?: 0
+                    val down = totals?.optLong("vpnDown", 0) ?: 0
+                    val now = System.currentTimeMillis()
+                    val dt = (now - lastTs).coerceAtLeast(1) / 1000.0
+                    val upRate = ((up - lastUp).coerceAtLeast(0) / dt).toLong()
+                    val downRate = ((down - lastDown).coerceAtLeast(0) / dt).toLong()
+                    lastUp = up; lastDown = down; lastTs = now
+                    val text = "${workers} потоков · ↑ ${rate(upRate)} ↓ ${rate(downRate)}"
+                    updateNotification(text)
+                } catch (e: Exception) {
+                }
+            }
+        }
+        t.isDaemon = true
+        statsThread = t
+        t.start()
     }
 
     // ───────────────────────── уведомление ─────────────────────────
@@ -169,14 +232,10 @@ class RazvilkaVpnService : VpnService() {
 
     private fun buildNotification(text: String): Notification {
         val open = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE,
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
         val stop = PendingIntent.getService(
-            this,
-            1,
+            this, 1,
             Intent(this, RazvilkaVpnService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE,
         )
@@ -184,6 +243,7 @@ class RazvilkaVpnService : VpnService() {
             .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setContentIntent(open)
             .addAction(0, getString(R.string.action_disconnect), stop)
@@ -201,5 +261,14 @@ class RazvilkaVpnService : VpnService() {
         } else {
             startForeground(NOTIF_ID, notification)
         }
+    }
+
+    private fun rate(bytesPerSec: Long): String {
+        if (bytesPerSec < 1024) return "$bytesPerSec Б/с"
+        val u = listOf("КБ/с", "МБ/с", "ГБ/с")
+        var v = bytesPerSec.toDouble() / 1024
+        var i = 0
+        while (v >= 1024 && i < u.size - 1) { v /= 1024; i++ }
+        return String.format("%.1f %s", v, u[i])
     }
 }

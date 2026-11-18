@@ -85,3 +85,22 @@ jobs:
           git add razvilka-debug.apk
           git commit -q -m "APK build ${GITHUB_SHA::7}"
           git push -f origin build-apk
+
+      - name: Имя файла для релиза
+        if: success()
+        run: |
+          APK=$(find android-app/app/build/outputs/apk/debug -name '*.apk' | head -1)
+          cp "$APK" razvilka-android-arm64.apk
+
+      - name: Релиз на GitHub
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Развилка — Android (сборка ${{ github.run_number }})"
+          body: |
+            Debug-сборка Развилки под Android (arm64-v8a).
+            Коммит ${{ github.sha }}.
+            Установка: включить «Неизвестные источники» → открыть .apk → установить.
+          files: razvilka-android-arm64.apk
+          make_latest: true

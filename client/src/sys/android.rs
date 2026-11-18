@@ -33,6 +33,17 @@ const TUN_MTU: usize = 1300;
 /// fd установленного туннеля, переданный Kotlin-слоем через JNI. -1 = не задан.
 static TUN_FD: AtomicI32 = AtomicI32::new(-1);
 
+/// true, пока у Rust открыт dup fd туннеля. Android держит VPN-интерфейс живым,
+/// пока открыт хоть один fd, поэтому Kotlin-слой ждёт сброса этого флага перед
+/// закрытием своего PFD и остановкой службы — иначе после «Отключить» трафик
+/// уходит в уже мёртвый туннель (нет интернета при «подключённой» сети).
+static TUN_FD_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [Android/JNI] Открыт ли ещё dup fd туннеля у ядра. Kotlin ждёт false при стопе.
+pub fn is_tun_fd_open() -> bool {
+    TUN_FD_OPEN.load(Ordering::Acquire)
+}
+
 /// [Android/JNI] Установить fd туннеля (из `ParcelFileDescriptor.getFd()`).
 /// Rust делает `dup` этого дескриптора и владеет копией; оригинал закрывает
 /// Kotlin при остановке сервиса. Вызывать ДО включения туннеля.
@@ -78,6 +89,7 @@ impl AndroidTun {
             unsafe { libc::close(tun_fd) };
             return Err(err);
         }
+        TUN_FD_OPEN.store(true, Ordering::Release);
         Ok(Self { tun_fd, event_fd })
     }
 }
@@ -154,6 +166,9 @@ impl Drop for AndroidTun {
             libc::close(self.tun_fd);
             libc::close(self.event_fd);
         }
+        // fd туннеля закрыт — Android снимет VPN-интерфейс; Kotlin может
+        // закрывать свой PFD и останавливать службу.
+        TUN_FD_OPEN.store(false, Ordering::Release);
     }
 }
 

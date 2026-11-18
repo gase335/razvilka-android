@@ -113,6 +113,13 @@ fn do_stop_tunnel() {
     if let Some(s) = state() {
         let cfg = s.config.lock().unwrap().clone();
         s.engine.set_tunnel(cfg, false);
+        // Ждём, пока ядро реально отпустит dup fd туннеля: пока он открыт,
+        // Android держит VPN-интерфейс, и закрывать PFD/останавливать службу
+        // нельзя (иначе трафик уходит в мёртвый туннель — нет интернета).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        while razvilka::sys::is_tun_fd_open() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
     }
 }
 

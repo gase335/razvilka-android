@@ -2,33 +2,47 @@
 package app.razvilka
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import org.json.JSONArray
-import org.json.JSONObject
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
+
+    private val vm: RazvilkaViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,29 +51,26 @@ class MainActivity : ComponentActivity() {
         ConfigStore.ensureGeoip(this)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    RazvilkaApp()
-                }
+                Surface(Modifier.fillMaxSize()) { RazvilkaApp(vm) }
             }
         }
     }
+
+    override fun onStop() {
+        vm.persist()
+        super.onStop()
+    }
 }
+
+private data class Tab(val title: String, val icon: ImageVector)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun RazvilkaApp() {
-    val ctx = androidx.compose.ui.platform.LocalContext.current
-    var cfg by remember { mutableStateOf(ConfigStore.load(ctx)) }
-    val entries = remember { mutableStateListOf<RouteEntry>().apply { addAll(cfg.list) } }
+fun RazvilkaApp(vm: RazvilkaViewModel) {
+    val ctx = LocalContext.current
+    var tab by rememberSaveable { mutableStateOf(0) }
 
-    var statusTitle by remember { mutableStateOf("Отключено") }
-    var tunnelState by remember { mutableStateOf("off") }
-    var detail by remember { mutableStateOf("") }
-    var speed by remember { mutableStateOf("") }
-    val logBuffer = remember { StringBuilder() }
-    var logText by remember { mutableStateOf("") }
-
-    // Запрос разрешения на уведомления (Android 13+).
+    // Разрешение на уведомления (Android 13+).
     val notifLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) {}
@@ -72,115 +83,69 @@ fun RazvilkaApp() {
         }
     }
 
-    // Согласие VpnService.prepare → затем запуск службы.
     val vpnLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
-        if (result.resultCode == android.app.Activity.RESULT_OK) {
-            startVpn(ctx)
-        }
-    }
-
-    fun persist() {
-        cfg.list = entries.toMutableList()
-        ConfigStore.save(ctx, cfg)
+        if (result.resultCode == android.app.Activity.RESULT_OK) startVpn(ctx)
     }
 
     fun connect() {
-        persist()
-        NativeBridge.nativeSetConfig(cfg.toJson())
+        vm.persist()
         val prepare = VpnService.prepare(ctx)
-        if (prepare != null) {
-            vpnLauncher.launch(prepare)
-        } else {
-            startVpn(ctx)
-        }
+        if (prepare != null) vpnLauncher.launch(prepare) else startVpn(ctx)
     }
 
     fun disconnect() {
-        val intent = Intent(ctx, RazvilkaVpnService::class.java).setAction(RazvilkaVpnService.ACTION_STOP)
-        ctx.startService(intent)
+        ctx.startService(Intent(ctx, RazvilkaVpnService::class.java)
+            .setAction(RazvilkaVpnService.ACTION_STOP))
     }
 
-    // Опрос статуса, журнала и капчи раз в секунду.
+    // Капча (режим wv): опрашиваем и открываем WebView.
     LaunchedEffect(Unit) {
         while (true) {
-            try {
-                val st = JSONObject(NativeBridge.nativeStatus())
-                val tunnel = st.optJSONObject("tunnel")
-                tunnelState = tunnel?.optString("state", "off") ?: "off"
-                detail = tunnel?.optString("detail", "") ?: ""
-                val sessions = st.optJSONArray("sessions") ?: JSONArray()
-                statusTitle = when {
-                    sessions.length() > 0 -> sessions.getJSONObject(0).optString("statusTitle", stateTitle(tunnelState))
-                    else -> stateTitle(tunnelState)
-                }
-                val totals = st.optJSONObject("totals")
-                if (totals != null) {
-                    val up = totals.optLong("vpnUp"); val down = totals.optLong("vpnDown")
-                    speed = "↑ ${human(up)}  ↓ ${human(down)}"
-                }
-            } catch (e: Exception) { /* ядро ещё не готово */ }
-
-            val fresh = try { NativeBridge.nativePollLog() } catch (e: Exception) { "" }
-            if (fresh.isNotEmpty()) {
-                logBuffer.append(fresh)
-                // держим последние ~12000 символов
-                if (logBuffer.length > 12000) logBuffer.delete(0, logBuffer.length - 12000)
-                logText = logBuffer.toString()
-            }
             checkCaptcha(ctx)
-            delay(1000)
+            delay(1500)
         }
     }
 
-    val connected = tunnelState == "on" || tunnelState == "starting"
-    val scroll = rememberScrollState()
+    val tabs = listOf(
+        Tab("Старт", Icons.Filled.PlayArrow),
+        Tab("Сервер", Icons.Filled.Settings),
+        Tab("Маршруты", Icons.Filled.List),
+        Tab("Прокси", Icons.Filled.Share),
+        Tab("Журнал", Icons.Filled.Info),
+    )
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Развилка") }) },
-    ) { pad ->
-        Column(
-            modifier = Modifier
-                .padding(pad)
-                .padding(16.dp)
-                .fillMaxSize()
-                .verticalScroll(scroll),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            StatusCard(statusTitle, detail, speed, connected, tunnelState,
-                onConnect = { connect() }, onDisconnect = { disconnect() })
-
-            ServerCard(cfg, onChange = { cfg = it.copy() }, onApplyLink = { link ->
-                RazvilkaConfig.parseLink(link)?.let { p ->
-                    cfg = cfg.copy(host = p.host, port = p.port, password = p.password,
-                        vkHashes = if (p.hashes.isNotBlank()) p.hashes else cfg.vkHashes)
+        bottomBar = {
+            NavigationBar {
+                tabs.forEachIndexed { i, t ->
+                    NavigationBarItem(
+                        selected = tab == i,
+                        onClick = { tab = i },
+                        icon = { Icon(t.icon, contentDescription = t.title) },
+                        label = { Text(t.title) },
+                    )
                 }
-            })
-
-            RoutingCard(cfg, entries, onModeChange = { cfg = cfg.copy(tunnelMode = it) })
-
-            SettingsCard(cfg, onChange = { cfg = it.copy() })
-
-            LogCard(logText)
-
-            Text(
-                "Один сервер за раз · правила «Программа» на Android не поддерживаются",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(24.dp))
+            }
+        },
+    ) { pad ->
+        Box(Modifier.padding(pad).fillMaxSize()) {
+            when (tab) {
+                0 -> ConnectScreen(vm, ::connect, ::disconnect)
+                1 -> ServerScreen(vm)
+                2 -> RoutingScreen(vm)
+                3 -> ProxyScreen(vm)
+                else -> LogScreen(vm)
+            }
         }
     }
 }
 
-private fun startVpn(ctx: android.content.Context) {
+private fun startVpn(ctx: Context) {
     val intent = Intent(ctx, RazvilkaVpnService::class.java).setAction(RazvilkaVpnService.ACTION_START)
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        ctx.startForegroundService(intent)
-    } else {
-        ctx.startService(intent)
-    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(intent)
+    else ctx.startService(intent)
 }
 
 private fun stateTitle(state: String): String = when (state) {
@@ -191,207 +156,252 @@ private fun stateTitle(state: String): String = when (state) {
     else -> "Отключено"
 }
 
-private fun human(bytes: Long): String {
-    if (bytes < 1024) return "$bytes Б"
-    val units = listOf("КБ", "МБ", "ГБ", "ТБ")
-    var v = bytes.toDouble() / 1024
-    var i = 0
-    while (v >= 1024 && i < units.size - 1) { v /= 1024; i++ }
-    return String.format("%.1f %s", v, units[i])
+private fun human(bytesPerSec: Long): String {
+    if (bytesPerSec < 1024) return "$bytesPerSec Б/с"
+    val u = listOf("КБ/с", "МБ/с", "ГБ/с")
+    var v = bytesPerSec.toDouble() / 1024; var i = 0
+    while (v >= 1024 && i < u.size - 1) { v /= 1024; i++ }
+    return String.format("%.1f %s", v, u[i])
 }
 
 private var lastCaptchaKey = ""
-private fun checkCaptcha(ctx: android.content.Context) {
+private fun checkCaptcha(ctx: Context) {
     val raw = try { NativeBridge.nativePollCaptcha() } catch (e: Exception) { "[]" }
     val arr = try { JSONArray(raw) } catch (e: Exception) { JSONArray() }
     if (arr.length() == 0) return
     val req = arr.getJSONObject(0)
     val session = req.optInt("session", 0)
-    val mode = req.optString("mode", "auto")
     val uri = req.optString("redirectUri", "")
     val key = "$session|$uri"
     if (uri.isBlank() || key == lastCaptchaKey) return
     lastCaptchaKey = key
-    val intent = Intent(ctx, CaptchaActivity::class.java)
+    ctx.startActivity(Intent(ctx, CaptchaActivity::class.java)
         .putExtra(CaptchaActivity.EXTRA_SESSION, session)
-        .putExtra(CaptchaActivity.EXTRA_MODE, mode)
+        .putExtra(CaptchaActivity.EXTRA_MODE, req.optString("mode", "auto"))
         .putExtra(CaptchaActivity.EXTRA_URL, uri)
-        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    ctx.startActivity(intent)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
 }
 
-// ───────────────────────── карточки ─────────────────────────
+// ───────────────────────── страница 1: Старт ─────────────────────────
 
 @Composable
-private fun StatusCard(
-    title: String, detail: String, speed: String, connected: Boolean, state: String,
-    onConnect: () -> Unit, onDisconnect: () -> Unit,
-) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(title, style = MaterialTheme.typography.headlineSmall)
-            if (detail.isNotBlank()) Text(detail, style = MaterialTheme.typography.bodyMedium)
-            if (speed.isNotBlank() && connected) Text(speed, style = MaterialTheme.typography.bodyMedium)
-            if (connected) {
-                Button(onClick = onDisconnect, modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
-                    Text("Отключить")
-                }
-            } else {
-                Button(onClick = onConnect, modifier = Modifier.fillMaxWidth()) {
-                    Text("Подключить")
-                }
+private fun ConnectScreen(vm: RazvilkaViewModel, onConnect: () -> Unit, onDisconnect: () -> Unit) {
+    Column(
+        Modifier.fillMaxSize().padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(stateTitle(vm.tunnelState), style = MaterialTheme.typography.headlineMedium)
+        if (vm.statusDetail.isNotBlank()) {
+            Spacer(Modifier.height(6.dp))
+            Text(vm.statusDetail, style = MaterialTheme.typography.bodyMedium)
+        }
+        Spacer(Modifier.height(24.dp))
+        if (vm.connected) {
+            Text("${vm.activeWorkers} потоков", style = MaterialTheme.typography.titleLarge)
+            Spacer(Modifier.height(4.dp))
+            Text("↑ ${human(vm.upRate)}   ↓ ${human(vm.downRate)}",
+                style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(32.dp))
+            Button(onClick = onDisconnect, modifier = Modifier.fillMaxWidth().height(64.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
+                Text("Отключить", style = MaterialTheme.typography.titleLarge)
+            }
+        } else {
+            Spacer(Modifier.height(32.dp))
+            Button(onClick = onConnect, modifier = Modifier.fillMaxWidth().height(64.dp)) {
+                Text("Подключить", style = MaterialTheme.typography.titleLarge)
             }
         }
     }
 }
 
+// ───────────────────────── страница 2: Сервер ─────────────────────────
+
 @Composable
-private fun ServerCard(cfg: RazvilkaConfig, onChange: (RazvilkaConfig) -> Unit, onApplyLink: (String) -> Unit) {
+private fun ServerScreen(vm: RazvilkaViewModel) {
+    val ctx = LocalContext.current
     var link by remember { mutableStateOf("") }
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Сервер csqtt", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(link, { link = it }, label = { Text("Ссылка csqtt://") },
-                modifier = Modifier.fillMaxWidth(), singleLine = true)
-            Button(onClick = { onApplyLink(link); link = "" }, enabled = link.isNotBlank()) {
-                Text("Применить ссылку")
-            }
-            OutlinedTextField(cfg.host, { onChange(cfg.copy(host = it)) }, label = { Text("Адрес (host)") },
-                modifier = Modifier.fillMaxWidth(), singleLine = true)
-            OutlinedTextField(cfg.port.toString(), { onChange(cfg.copy(port = it.toIntOrNull() ?: 0)) },
-                label = { Text("Порт") }, modifier = Modifier.fillMaxWidth(), singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-            OutlinedTextField(cfg.password, { onChange(cfg.copy(password = it)) }, label = { Text("Пароль") },
-                modifier = Modifier.fillMaxWidth(), singleLine = true)
-            OutlinedTextField(cfg.vkHashes, { onChange(cfg.copy(vkHashes = it)) },
-                label = { Text("Хеши звонков VK (через запятую/строки)") },
-                modifier = Modifier.fillMaxWidth().heightIn(min = 80.dp))
-            OutlinedTextField(cfg.workers.toString(), { onChange(cfg.copy(workers = it.toIntOrNull() ?: 9)) },
-                label = { Text("Потоков (кратно 9)") }, modifier = Modifier.fillMaxWidth(), singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-        }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("Настройка подключения", style = MaterialTheme.typography.titleLarge)
+
+        OutlinedTextField(link, { link = it }, label = { Text("Ссылка csqtt://") },
+            modifier = Modifier.fillMaxWidth(), singleLine = true)
+        Button(enabled = link.isNotBlank(), onClick = {
+            if (vm.applyLink(link)) { link = ""; toast(ctx, "Применено") } else toast(ctx, "Не ссылка csqtt://")
+        }) { Text("Применить ссылку") }
+
+        Field("Адрес (host)", vm.host) { vm.host = it }
+        Field("Порт", vm.port, number = true) { vm.port = it.filter { c -> c.isDigit() } }
+        Field("Пароль", vm.password) { vm.password = it }
+
+        OutlinedTextField(vm.vkHashes, { vm.vkHashes = it },
+            label = { Text("Хеши звонков VK") },
+            modifier = Modifier.fillMaxWidth().heightIn(min = 90.dp))
+        Text("Введено хешей: ${vm.enteredHashCount()}" +
+            if (vm.connected) " · используется: ${vm.activeHashes}" else "",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        Spacer(Modifier.height(4.dp))
+        Text("Потоков: ${vm.workers}", style = MaterialTheme.typography.titleMedium)
+        Slider(
+            value = vm.workers.toFloat(),
+            onValueChange = { vm.workers = (it / 9f).roundToInt() * 9 },
+            valueRange = 9f..189f,
+            steps = 19,
+        )
+        Text("кратно 9; один поток ≈ один стрим звонка",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        Choice("Отпечаток TLS", listOf("firefox", "chrome", "edge", "opera"), vm.fingerprint) { vm.fingerprint = it }
+        Choice("Капча", listOf("auto", "rjs", "wv"), vm.captchaMode) { vm.captchaMode = it }
+        Field("client_ids", vm.clientIds) { vm.clientIds = it }
+        SwitchRow("Перехватывать IPv6", vm.captureIpv6) { vm.captureIpv6 = it }
+        SwitchRow("Автоперезапуск сервера", vm.autoRestart) { vm.autoRestart = it }
+        Spacer(Modifier.height(24.dp))
     }
 }
 
+// ───────────────────────── страница 3: Маршруты ─────────────────────────
+
 @Composable
-private fun RoutingCard(cfg: RazvilkaConfig, entries: MutableList<RouteEntry>, onModeChange: (String) -> Unit) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Туннелирование", style = MaterialTheme.typography.titleMedium)
-            val modes = listOf("full" to "Всё через VPN", "blacklist" to "Чёрный список", "whitelist" to "Белый список")
-            Column {
-                for ((value, label) in modes) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected = cfg.tunnelMode == value, onClick = { onModeChange(value) })
-                        Text(label)
-                    }
-                }
-            }
-            if (cfg.tunnelMode != "full") {
-                val listLabel = if (cfg.tunnelMode == "blacklist") "Напрямую (мимо VPN):" else "Через VPN:"
-                Text(listLabel, style = MaterialTheme.typography.bodyMedium)
-                entries.forEachIndexed { i, e ->
-                    Row(verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        KindDropdown(e.kind) { entries[i] = e.copy(kind = it) }
-                        OutlinedTextField(e.value, { entries[i] = e.copy(value = it) },
-                            modifier = Modifier.weight(1f), singleLine = true,
-                            placeholder = { Text("значение") })
-                        IconButton(onClick = { entries.removeAt(i) }) { Text("✕") }
-                    }
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = { entries.add(RouteEntry()) }) { Text("Добавить") }
-                    OutlinedButton(onClick = {
-                        entries.clear(); entries.addAll(RazvilkaConfig.russiaPreset())
-                    }) { Text("Пресет: Россия") }
-                }
+private fun RoutingScreen(vm: RazvilkaViewModel) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Маршрутизация", style = MaterialTheme.typography.titleLarge)
+        val modes = listOf("full" to "Всё через VPN", "blacklist" to "Чёрный список", "whitelist" to "Белый список")
+        modes.forEach { (v, label) ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(selected = vm.tunnelMode == v, onClick = { vm.tunnelMode = v })
+                Text(label)
             }
         }
+        if (vm.tunnelMode != "full") {
+            Text(if (vm.tunnelMode == "blacklist") "Напрямую, мимо VPN:" else "Только через VPN:",
+                style = MaterialTheme.typography.bodyMedium)
+            vm.list.forEachIndexed { i, e ->
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    KindDropdown(e.kind) { vm.list[i] = e.copy(kind = it) }
+                    OutlinedTextField(e.value, { vm.list[i] = e.copy(value = it) },
+                        modifier = Modifier.weight(1f), singleLine = true,
+                        placeholder = { Text("значение") })
+                    IconButton(onClick = { vm.list.removeAt(i) }) { Text("✕") }
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { vm.list.add(RouteEntry()) }) { Text("Добавить") }
+                OutlinedButton(onClick = { vm.applyRussiaPreset() }) { Text("Пресет: Россия") }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+// ───────────────────────── страница 4: Прокси ─────────────────────────
+
 @Composable
-private fun KindDropdown(value: String, onChange: (String) -> Unit) {
-    val kinds = listOf("domain" to "Домен", "ip" to "IP", "country" to "Страна")
-    var open by remember { mutableStateOf(false) }
-    Box {
-        OutlinedButton(onClick = { open = true }) {
-            Text(kinds.firstOrNull { it.first == value }?.second ?: "Домен")
+private fun ProxyScreen(vm: RazvilkaViewModel) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("Прокси-сервер (SOCKS5)", style = MaterialTheme.typography.titleLarge)
+        Text("Поднимает SOCKS5-прокси в локальной сети: другие устройства (или приложения) " +
+            "ходят в интернет через этот телефон и его туннель. Работает вместе с VPN.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        SwitchRow("Включить прокси", vm.proxyEnabled) { vm.toggleProxy(it) }
+        if (vm.proxyEnabled && vm.proxyListen != null) {
+            Text("Слушает: ${vm.proxyListen}  (${proxyStateTitle(vm.proxyState)})",
+                style = MaterialTheme.typography.bodyMedium)
         }
-        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            for ((v, label) in kinds) {
-                DropdownMenuItem(text = { Text(label) }, onClick = { onChange(v); open = false })
-            }
+        Field("Порт", vm.proxyPort, number = true) { vm.proxyPort = it.filter { c -> c.isDigit() } }
+        Field("IP прослушивания (пусто = Wi-Fi адрес)", vm.proxyListenIp) { vm.proxyListenIp = it }
+        SwitchRow("Логин/пароль", vm.proxyAuth) { vm.proxyAuth = it }
+        if (vm.proxyAuth) {
+            Field("Логин", vm.proxyUser) { vm.proxyUser = it }
+            Field("Пароль", vm.proxyPass) { vm.proxyPass = it }
         }
+        Spacer(Modifier.height(24.dp))
     }
 }
 
+private fun proxyStateTitle(s: String) = when (s) {
+    "on" -> "работает"; "starting" -> "запуск…"; "failed" -> "ошибка"; else -> "выключен"
+}
+
+// ───────────────────────── страница 5: Журнал ─────────────────────────
+
 @Composable
-private fun SettingsCard(cfg: RazvilkaConfig, onChange: (RazvilkaConfig) -> Unit) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Настройки", style = MaterialTheme.typography.titleMedium)
-            SwitchRow("Перехватывать IPv6", cfg.captureIpv6) { onChange(cfg.copy(captureIpv6 = it)) }
-            SwitchRow("Автоперезапуск сервера", cfg.autoRestart) { onChange(cfg.copy(autoRestart = it)) }
-            SwitchRow("Локальные сети — напрямую", cfg.lanDirect) { onChange(cfg.copy(lanDirect = it)) }
-            ChoiceRow("Отпечаток TLS", listOf("firefox", "chrome", "edge", "opera"), cfg.fingerprint) {
-                onChange(cfg.copy(fingerprint = it))
-            }
-            ChoiceRow("Капча", listOf("auto", "rjs", "wv"), cfg.captchaMode) {
-                onChange(cfg.copy(captchaMode = it))
-            }
+private fun LogScreen(vm: RazvilkaViewModel) {
+    val ctx = LocalContext.current
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically) {
+            Text("Журнал", style = MaterialTheme.typography.titleLarge)
+            OutlinedButton(onClick = {
+                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("Razvilka log", vm.copyLogText()))
+                toast(ctx, "Журнал скопирован")
+            }) { Text("Копировать") }
         }
+        Spacer(Modifier.height(8.dp))
+        val scroll = rememberScrollState()
+        LaunchedEffect(vm.logText) { scroll.scrollTo(scroll.maxValue) }
+        Text(vm.logText.ifBlank { "—" },
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            modifier = Modifier.fillMaxWidth().weight(1f).verticalScroll(scroll))
     }
+}
+
+// ───────────────────────── общие элементы ─────────────────────────
+
+@Composable
+private fun Field(label: String, value: String, number: Boolean = false, onChange: (String) -> Unit) {
+    OutlinedTextField(
+        value, onChange, label = { Text(label) },
+        modifier = Modifier.fillMaxWidth(), singleLine = true,
+        keyboardOptions = if (number) KeyboardOptions(keyboardType = KeyboardType.Number) else KeyboardOptions.Default,
+    )
 }
 
 @Composable
 private fun SwitchRow(label: String, value: Boolean, onChange: (Boolean) -> Unit) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically) {
-        Text(label)
+        Text(label, Modifier.weight(1f))
         Switch(checked = value, onCheckedChange = onChange)
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ChoiceRow(label: String, options: List<String>, value: String, onChange: (String) -> Unit) {
+private fun Choice(label: String, options: List<String>, value: String, onChange: (String) -> Unit) {
     var open by remember { mutableStateOf(false) }
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically) {
         Text(label)
         Box {
             OutlinedButton(onClick = { open = true }) { Text(value) }
-            DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-                for (o in options) {
-                    DropdownMenuItem(text = { Text(o) }, onClick = { onChange(o); open = false })
-                }
+            DropdownMenu(open, { open = false }) {
+                options.forEach { o -> DropdownMenuItem(text = { Text(o) }, onClick = { onChange(o); open = false }) }
             }
         }
     }
 }
 
 @Composable
-private fun LogCard(logText: String) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp)) {
-            Text("Журнал", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(8.dp))
-            val scroll = rememberScrollState()
-            LaunchedEffect(logText) { scroll.scrollTo(scroll.maxValue) }
-            Text(
-                logText.ifBlank { "—" },
-                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                maxLines = 400,
-                overflow = TextOverflow.Clip,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 260.dp)
-                    .verticalScroll(scroll),
-            )
+private fun KindDropdown(value: String, onChange: (String) -> Unit) {
+    val kinds = listOf("domain" to "Домен", "ip" to "IP", "country" to "Страна")
+    var open by remember { mutableStateOf(false) }
+    Box {
+        OutlinedButton(onClick = { open = true }) { Text(kinds.firstOrNull { it.first == value }?.second ?: "Домен") }
+        DropdownMenu(open, { open = false }) {
+            kinds.forEach { (v, label) -> DropdownMenuItem(text = { Text(label) }, onClick = { onChange(v); open = false }) }
         }
     }
 }
+
+private fun toast(ctx: Context, msg: String) = Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()

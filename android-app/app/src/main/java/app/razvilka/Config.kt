@@ -36,6 +36,13 @@ data class RazvilkaConfig(
     // Split-tunnel
     var tunnelMode: String = "blacklist",  // full | whitelist | blacklist
     var list: MutableList<RouteEntry> = mutableListOf(),
+    // Прокси-сервер (SOCKS5/SOCKS4/HTTP на одном порту) для устройств в LAN
+    var proxyEnabled: Boolean = false,
+    var proxyPort: Int = 1080,
+    var proxyListenIp: String = "",   // пусто = адрес в локальной сети (Wi-Fi)
+    var proxyAuth: Boolean = false,
+    var proxyUser: String = "",
+    var proxyPass: String = "",
     // Прочее
     var captureIpv6: Boolean = false,
     var autoRestart: Boolean = true,
@@ -49,7 +56,7 @@ data class RazvilkaConfig(
         root.put("lan_direct", lanDirect)
         root.put("merge_same_server", true)
         root.put("tunnel_on", true)
-        root.put("proxy_on", false)
+        root.put("proxy_on", proxyEnabled)
 
         val profile = JSONObject()
             .put("id", "server-1")
@@ -100,6 +107,15 @@ data class RazvilkaConfig(
             JSONObject()
                 .put("hijack_all", true)
                 .put("filter_aaaa_for_tunnel", true),
+        )
+        root.put(
+            "proxy",
+            JSONObject()
+                .put("listen_ip", proxyListenIp.trim())
+                .put("port", proxyPort)
+                .put("auth", proxyAuth)
+                .put("username", proxyUser)
+                .put("password", proxyPass),
         )
         return root.toString()
     }
